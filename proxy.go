@@ -612,3 +612,15 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
+
+// partUpload 结构用于在分块上传中传递分片数据
+type partUpload struct {
+	PartNumber int
+	Data       []byte
+}
+
+// uploadedPart 结构用于保存已上传分片的信息
+type uploadedPart struct {
+	PartNumber int
+	ETag       string
+}
