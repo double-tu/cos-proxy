@@ -48,6 +48,15 @@ func getLocalIPv4s() ([]string, error) {
 	return ips, nil
 }
 
+// requestLoggingMiddleware 记录所有到达的请求 (最外层,用于调试)
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("🔵 RAW REQUEST: %s %s %s | Host: %s | From: %s",
+			r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.RemoteAddr)
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ipWhitelistMiddleware 是一个HTTP中间件，用于检查IP白名单
 func ipWhitelistMiddleware(next http.Handler, allowedIPs map[string]bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -478,11 +487,12 @@ func main() {
 		secretKey: secretKey,
 	}
 	handlerWithWhitelist := ipWhitelistMiddleware(proxyHandler, allowedIPs)
+	handlerWithLogging := requestLoggingMiddleware(handlerWithWhitelist)
 
 	log.Printf("Starting COS proxy server on %s", listenAddr)
 	log.Printf("Proxying requests to COS bucket: %s", u.Host)
 
-	if err := http.ListenAndServe(listenAddr, handlerWithWhitelist); err != nil {
+	if err := http.ListenAndServe(listenAddr, handlerWithLogging); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
