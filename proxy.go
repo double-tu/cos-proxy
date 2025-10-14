@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net" // 新增 "net" 包用于获取本机 IP
 	"net/http"
 	"net/url"
@@ -60,8 +61,21 @@ func ipWhitelistMiddleware(next http.Handler, allowedIPs map[string]bool) http.H
 		// 从 Nginx 设置的 'X-Real-IP' 头获取真实IP
 		clientIP := r.Header.Get("X-Real-IP")
 		if clientIP == "" {
-			// 如果没有这个头，说明请求可能没有经过Nginx，直接拒绝
-			log.Printf("Forbidden: Missing X-Real-IP header. RemoteAddr: %s", r.RemoteAddr)
+			// 如果 X-Real-IP 头为空，则尝试从 RemoteAddr 获取 IP
+			// 这对于不经过 Nginx 的本地直接访问是必要的
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				// 如果解析 RemoteAddr 失败，则记录错误并拒绝请求
+				log.Printf("Bad Request: could not split host port from %s: %v", r.RemoteAddr, err)
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			clientIP = host
+		}
+
+		// 如果最终 clientIP 仍然为空，则拒绝请求
+		if clientIP == "" {
+			log.Printf("Forbidden: Could not determine client IP. RemoteAddr: %s", r.RemoteAddr)
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -87,7 +101,8 @@ type COSProxyHandler struct {
 // ServeHTTP 是处理所有传入请求的核心方法
 func (h *COSProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	objectKey := strings.TrimPrefix(r.URL.Path, "/")
-	if objectKey == "" {
+	// 对于 POST 请求，objectKey 可能在表单数据中，而不是在 URL 路径中
+	if objectKey == "" && r.Method != http.MethodPost {
 		http.Error(w, "Object key is missing in the URL path.", http.StatusBadRequest)
 		return
 	}
@@ -101,6 +116,8 @@ func (h *COSProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handlePutObject(w, r, objectKey)
 	case http.MethodDelete:
 		h.handleDeleteObject(w, r, objectKey)
+	case http.MethodPost:
+		h.handlePostObject(w, r)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -142,6 +159,49 @@ func (h *COSProxyHandler) handleDeleteObject(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
+}
+
+// handlePostObject 处理通过 multipart/form-data 上传对象的请求
+func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Request) {
+	// 1. 解析 multipart/form-data 请求
+	// 设置内存限制为 32MB
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 2. 从表单中获取 'key' 字段
+	objectKey := r.FormValue("key")
+	if objectKey == "" {
+		http.Error(w, "Form field 'key' is required.", http.StatusBadRequest)
+		return
+	}
+
+	// 3. 从表单中获取 'file' 字段
+	var file multipart.File
+	var header *multipart.FileHeader
+	var err error
+	file, header, err = r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Failed to get file from form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// 4. 处理 key 中的 ${filename} 占位符
+	finalObjectKey := strings.Replace(objectKey, "${filename}", header.Filename, -1)
+	log.Printf("Uploading file '%s' to COS with key '%s'", header.Filename, finalObjectKey)
+
+	// 5. 使用 SDK 上传文件流到 COS
+	resp, err := h.client.Object.Put(context.Background(), finalObjectKey, file, nil)
+	if err != nil {
+		handleCOSError(w, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 6. 返回成功响应
 	w.WriteHeader(resp.StatusCode)
 }
 
