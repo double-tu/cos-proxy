@@ -1,0 +1,21 @@
+version: '3'
+
+services:
+  cos-proxy:
+    container_name: cos-proxy-app
+    # build 指令会告诉 docker-compose 在当前目录下寻找 Dockerfile 来构建镜像
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # restart: always 保证容器在退出后总是会自动重启
+    restart: always
+    # 将主机的 8080 端口映射到容器的 8080 端口
+    # 这样，您主机上的 Nginx 就可以通过 127.0.0.1:8080 访问这个服务了
+    ports:
+      - "17700:8080"
+    # 从 .env 文件中读取环境变量并传递给容器
+    environment:
+      - COS_BUCKET_URL_INTERNAL=${COS_BUCKET_URL_INTERNAL}
+      - TENCENTCLOUD_SECRET_ID=${TENCENTCLOUD_SECRET_ID}
+      - TENCENTCLOUD_SECRET_KEY=${TENCENTCLOUD_SECRET_KEY}
+      - WHITELIST_IPS=${WHITELIST_IPS}
