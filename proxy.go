@@ -148,6 +148,12 @@ func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer resp.Body.Close()
+	// 先复制响应头
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
@@ -160,6 +166,12 @@ func (h *COSProxyHandler) handleDeleteObject(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer resp.Body.Close()
+	// 先复制响应头
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
@@ -168,7 +180,7 @@ func (h *COSProxyHandler) handleDeleteObject(w http.ResponseWriter, r *http.Requ
 func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	// 1. 解析 multipart/form-data 请求
 	// 设置内存限制为 32MB
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(128 << 20); err != nil {
 		http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -204,6 +216,12 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 	defer resp.Body.Close()
 
 	// 6. 返回成功响应
+	// 先复制响应头
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
@@ -212,7 +230,18 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 func handleCOSError(w http.ResponseWriter, err error) {
 	if cosErr, ok := err.(*cos.ErrorResponse); ok {
 		log.Printf("COS Error: Code=%s, Message=%s, RequestID=%s", cosErr.Code, cosErr.Message, cosErr.RequestID)
-		http.Error(w, cosErr.Message, cosErr.Response.StatusCode)
+		// 确保在函数结束时关闭响应体
+		defer cosErr.Response.Body.Close()
+		// 复制原始的COS错误响应头
+		for key, values := range cosErr.Response.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		// 写入原始的COS错误状态码
+		w.WriteHeader(cosErr.Response.StatusCode)
+		// 复制原始的COS错误响应体 (XML)
+		io.Copy(w, cosErr.Response.Body)
 		return
 	}
 	log.Printf("Internal Server Error: %v", err)
