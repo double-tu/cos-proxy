@@ -2,6 +2,10 @@
 # 使用官方的 Golang 镜像作为构建环境
 FROM golang:1.22-alpine AS builder
 
+ENV GOPROXY=https://mirror.ccs.tencentyun.com,https://goproxy.cn,https://docker.1panel.live,https://docker-0.unsee.tech,https://docker.m.daocloud.io,https://registry.cyou,direct
+ENV GOSUMDB=off
+ENV GOPRIVATE=
+
 # 设置工作目录
 WORKDIR /app
 
