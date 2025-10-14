@@ -1,6 +1,6 @@
 # --- Stage 1: Build ---
 # 使用官方的 Golang 镜像作为构建环境
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ENV GOPROXY=https://mirror.ccs.tencentyun.com,https://goproxy.cn,https://docker.1panel.live,https://docker-0.unsee.tech,https://docker.m.daocloud.io,https://registry.cyou,direct
 ENV GOSUMDB=off
