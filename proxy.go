@@ -142,12 +142,44 @@ func (h *COSProxyHandler) handleGetObject(w http.ResponseWriter, r *http.Request
 
 // handlePutObject 处理上传对象请求
 func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request, key string) {
-	resp, err := h.client.Object.Put(context.Background(), key, r.Body, nil)
+	// 获取 Content-Type,如果客户端没有提供则使用默认值
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	// 构建上传选项
+	opt := &cos.ObjectPutOptions{
+		ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{
+			ContentType:   contentType,
+			ContentLength: r.ContentLength,
+		},
+	}
+
+	// 只传递特定的自定义头部(x-cos-meta-*), 避免传递不相关的头部
+	for key, values := range r.Header {
+		if strings.HasPrefix(strings.ToLower(key), "x-cos-meta-") {
+			if opt.ObjectPutHeaderOptions.XCosMetaXXX == nil {
+				opt.ObjectPutHeaderOptions.XCosMetaXXX = &http.Header{}
+			}
+			for _, value := range values {
+				opt.ObjectPutHeaderOptions.XCosMetaXXX.Add(key, value)
+			}
+		}
+	}
+
+	log.Printf("Uploading to COS: key=%s, ContentType=%s, ContentLength=%d",
+		key, contentType, r.ContentLength)
+
+	resp, err := h.client.Object.Put(context.Background(), key, r.Body, opt)
 	if err != nil {
 		handleCOSError(w, err)
 		return
 	}
 	defer resp.Body.Close()
+
+	log.Printf("COS PUT Response: StatusCode=%d", resp.StatusCode)
+
 	// 先复制响应头
 	for key, values := range resp.Header {
 		for _, value := range values {
@@ -156,6 +188,8 @@ func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+
+	log.Printf("Successfully proxied PUT request for key: %s", key)
 }
 
 // handleDeleteObject 处理删除对象请求
@@ -179,7 +213,7 @@ func (h *COSProxyHandler) handleDeleteObject(w http.ResponseWriter, r *http.Requ
 // handlePostObject 处理通过 multipart/form-data 上传对象的请求
 func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	// 1. 解析 multipart/form-data 请求
-	// 设置内存限制为 32MB
+	// 设置内存限制为 128MB
 	if err := r.ParseMultipartForm(128 << 20); err != nil {
 		http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
 		return
@@ -205,17 +239,58 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 
 	// 4. 处理 key 中的 ${filename} 占位符
 	finalObjectKey := strings.Replace(objectKey, "${filename}", header.Filename, -1)
-	log.Printf("Uploading file '%s' to COS with key '%s'", header.Filename, finalObjectKey)
 
-	// 5. 使用 SDK 上传文件流到 COS
-	resp, err := h.client.Object.Put(context.Background(), finalObjectKey, file, nil)
+	// 5. 获取文件的真实 Content-Type
+	// 优先使用表单中文件的 Content-Type,如果没有则根据文件扩展名推断
+	contentType := header.Header.Get("Content-Type")
+	if contentType == "" {
+		// 根据文件扩展名推断 Content-Type
+		if strings.HasSuffix(strings.ToLower(header.Filename), ".webm") {
+			contentType = "audio/webm"
+		} else if strings.HasSuffix(strings.ToLower(header.Filename), ".mp3") {
+			contentType = "audio/mpeg"
+		} else if strings.HasSuffix(strings.ToLower(header.Filename), ".wav") {
+			contentType = "audio/wav"
+		} else if strings.HasSuffix(strings.ToLower(header.Filename), ".mp4") {
+			contentType = "video/mp4"
+		} else {
+			contentType = "application/octet-stream"
+		}
+	}
+
+	log.Printf("Uploading file '%s' to COS with key '%s', ContentType '%s', Size %d bytes",
+		header.Filename, finalObjectKey, contentType, header.Size)
+
+	// 6. 使用 SDK 上传文件流到 COS
+	opt := &cos.ObjectPutOptions{
+		ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{
+			ContentType:   contentType,
+			ContentLength: header.Size,
+		},
+	}
+
+	// 只传递特定的自定义元数据头部(x-cos-meta-*)
+	for key, values := range r.Header {
+		if strings.HasPrefix(strings.ToLower(key), "x-cos-meta-") {
+			if opt.ObjectPutHeaderOptions.XCosMetaXXX == nil {
+				opt.ObjectPutHeaderOptions.XCosMetaXXX = &http.Header{}
+			}
+			for _, value := range values {
+				opt.ObjectPutHeaderOptions.XCosMetaXXX.Add(key, value)
+			}
+		}
+	}
+
+	resp, err := h.client.Object.Put(context.Background(), finalObjectKey, file, opt)
 	if err != nil {
 		handleCOSError(w, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 6. 返回成功响应
+	log.Printf("COS POST Response: StatusCode=%d", resp.StatusCode)
+
+	// 7. 返回成功响应
 	// 先复制响应头
 	for key, values := range resp.Header {
 		for _, value := range values {
