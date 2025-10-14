@@ -149,6 +149,7 @@ func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // handleDeleteObject 处理删除对象请求
@@ -160,6 +161,7 @@ func (h *COSProxyHandler) handleDeleteObject(w http.ResponseWriter, r *http.Requ
 	}
 	defer resp.Body.Close()
 	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // handlePostObject 处理通过 multipart/form-data 上传对象的请求
@@ -203,6 +205,7 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 
 	// 6. 返回成功响应
 	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // handleCOSError 是一个辅助函数，用于处理来自 COS SDK 的错误
