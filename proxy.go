@@ -342,18 +342,16 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 
 // handleMultipartUpload 处理分块上传相关的请求 (用于大文件或流式上传)
 func (h *COSProxyHandler) handleMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
-	log.Printf("Handling multipart upload: key=%s, query=%s", key, r.URL.RawQuery)
+	log.Printf("Handling multipart upload: path=%s, query=%s", r.URL.Path, r.URL.RawQuery)
 
-	// 构建完整的URL,包括查询参数
-	targetURL := h.client.BaseURL.BucketURL.String() + "/" + key
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
-	}
+	// 使用 ResolveReference 从 Bucket 基础 URL 和传入的请求 URI 构建目标 URL。
+	// 这种方法能正确处理路径（例如，避免双斜杠）和查询参数，比手动拼接字符串更健壮。
+	targetURL := h.client.BaseURL.BucketURL.ResolveReference(r.URL)
 
-	log.Printf("Proxying multipart request to: %s", targetURL)
+	log.Printf("Proxying multipart request to: %s", targetURL.String())
 
 	// 创建新的请求
-	proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
+	proxyReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		log.Printf("Failed to create proxy request: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
