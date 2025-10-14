@@ -5,6 +5,7 @@
 /node_modules
 /renderer/node_modules
 /demo
+cos.go
 
 # Build output
 .*/dist

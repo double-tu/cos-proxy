@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/tencentyun/cos-go-sdk-v5"
+	"golang.org/x/sync/errgroup"
 )
 
 // getLocalIPv4s 会检测并返回本机所有的非环回 IPv4 地址
@@ -134,27 +137,17 @@ func (h *COSProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.handleGetObject(w, r, objectKey)
 	case http.MethodPut:
-		// PUT 可能是普通上传或者分块上传的一部分
-		queryParams := r.URL.Query()
-		if queryParams.Has("partNumber") && queryParams.Has("uploadId") {
-			// 分块上传的单个分块: PUT /{key}?partNumber=N&uploadId=xxx
-			h.handleMultipartUpload(w, r, objectKey)
-		} else {
-			// 普通的 PUT 上传
-			h.handlePutObject(w, r, objectKey)
-		}
+		// 所有 PUT 请求（无论是简单上传还是分块上传的 part）都由 handlePutObject 处理
+		h.handlePutObject(w, r, objectKey)
 	case http.MethodDelete:
 		h.handleDeleteObject(w, r, objectKey)
 	case http.MethodPost:
-		// POST 可能是表单上传或者分块上传相关操作
 		queryParams := r.URL.Query()
+		// 分块上传的 POST 请求（初始化、完成）也由 handlePutObject 处理
 		if queryParams.Has("uploads") || queryParams.Has("uploadId") {
-			// 分块上传相关的 POST 请求:
-			// - POST /{key}?uploads - 初始化分块上传
-			// - POST /{key}?uploadId=xxx - 完成分块上传
-			h.handleMultipartUpload(w, r, objectKey)
+			h.handlePutObject(w, r, objectKey)
 		} else {
-			// 普通的 multipart/form-data 表单上传
+			// 其他 POST 请求（如表单上传）保持不变
 			h.handlePostObject(w, r)
 		}
 	default:
@@ -179,15 +172,37 @@ func (h *COSProxyHandler) handleGetObject(w http.ResponseWriter, r *http.Request
 	io.Copy(w, resp.Body)
 }
 
-// handlePutObject 处理上传对象请求
+// handlePutObject 处理所有上传请求，包括简单上传和分块上传
 func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request, key string) {
-	// 获取 Content-Type,如果客户端没有提供则使用默认值
+	// 检查是否是分块上传的相关操作（初始化、完成、中止）
+	// 这些操作没有请求体，直接透传
+	queryParams := r.URL.Query()
+	if (r.Method == http.MethodPost && (queryParams.Has("uploads") || queryParams.Has("uploadId"))) ||
+		(r.Method == http.MethodDelete && queryParams.Has("uploadId")) {
+		h.proxyMultipartRequest(w, r)
+		return
+	}
+
+	// 对于 PUT 请求，根据 Content-Length 决定上传策略
+	contentLength := r.ContentLength
+	const simpleUploadThreshold int64 = 5 * 1024 * 1024 // 5MB
+
+	if contentLength != -1 && contentLength < simpleUploadThreshold {
+		// 文件较小，使用简单上传
+		h.executeSimplePut(w, r, key)
+	} else {
+		// 文件较大或大小未知（流式），使用分块上传
+		h.executeMultipartPut(w, r, key)
+	}
+}
+
+// executeSimplePut 执行标准的 PutObject 操作
+func (h *COSProxyHandler) executeSimplePut(w http.ResponseWriter, r *http.Request, key string) {
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 
-	// 构建上传选项
 	opt := &cos.ObjectPutOptions{
 		ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{
 			ContentType:   contentType,
@@ -195,21 +210,19 @@ func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request
 		},
 	}
 
-	// 只传递特定的自定义头部(x-cos-meta-*), 避免传递不相关的头部
-	for key, values := range r.Header {
-		if strings.HasPrefix(strings.ToLower(key), "x-cos-meta-") {
+	// 传递自定义元数据
+	for headerKey, values := range r.Header {
+		if strings.HasPrefix(strings.ToLower(headerKey), "x-cos-meta-") {
 			if opt.ObjectPutHeaderOptions.XCosMetaXXX == nil {
 				opt.ObjectPutHeaderOptions.XCosMetaXXX = &http.Header{}
 			}
 			for _, value := range values {
-				opt.ObjectPutHeaderOptions.XCosMetaXXX.Add(key, value)
+				opt.ObjectPutHeaderOptions.XCosMetaXXX.Add(headerKey, value)
 			}
 		}
 	}
 
-	log.Printf("Uploading to COS: key=%s, ContentType=%s, ContentLength=%d",
-		key, contentType, r.ContentLength)
-
+	log.Printf("Executing simple PUT for key: %s, ContentLength: %d", key, r.ContentLength)
 	resp, err := h.client.Object.Put(context.Background(), key, r.Body, opt)
 	if err != nil {
 		handleCOSError(w, err)
@@ -217,9 +230,7 @@ func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 
-	log.Printf("COS PUT Response: StatusCode=%d", resp.StatusCode)
-
-	// 先复制响应头
+	// 返回响应
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -227,8 +238,169 @@ func (h *COSProxyHandler) handlePutObject(w http.ResponseWriter, r *http.Request
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+	log.Printf("Successfully completed simple PUT for key: %s", key)
+}
 
-	log.Printf("Successfully proxied PUT request for key: %s", key)
+// executeMultipartPut 执行分块上传逻辑
+func (h *COSProxyHandler) executeMultipartPut(w http.ResponseWriter, r *http.Request, key string) {
+	log.Printf("Starting multipart upload for key: %s, ContentLength: %d", key, r.ContentLength)
+
+	// 1. 初始化分块上传
+	opt := &cos.InitiateMultipartUploadOptions{}
+	if contentType := r.Header.Get("Content-Type"); contentType != "" {
+		opt.ObjectPutHeaderOptions = &cos.ObjectPutHeaderOptions{ContentType: contentType}
+	}
+	initResult, _, err := h.client.Object.InitiateMultipartUpload(context.Background(), key, opt)
+	if err != nil {
+		handleCOSError(w, err)
+		return
+	}
+	uploadID := initResult.UploadID
+	log.Printf("Multipart upload initiated. UploadID: %s", uploadID)
+
+	// 2. 并发上传分片
+	const partSize = 8 * 1024 * 1024 // 固定分片大小为 8MB
+	const concurrency = 5             // 并发数
+
+	partsCh := make(chan partUpload, concurrency)
+	uploadedCh := make(chan uploadedPart, concurrency)
+	g, ctx := errgroup.WithContext(context.Background())
+
+	// 启动上传 goroutine 池
+	for i := 0; i < concurrency; i++ {
+		g.Go(func() error {
+			for part := range partsCh {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+					log.Printf("Uploading part %d for UploadID: %s", part.PartNumber, uploadID)
+					resp, err := h.client.Object.UploadPart(ctx, key, uploadID, part.PartNumber, bytes.NewReader(part.Data), nil)
+					if err != nil {
+						log.Printf("Error uploading part %d: %v", part.PartNumber, err)
+						return err
+					}
+					etag := resp.Header.Get("ETag")
+					uploadedCh <- uploadedPart{PartNumber: part.PartNumber, ETag: etag}
+					log.Printf("Successfully uploaded part %d, ETag: %s", part.PartNumber, etag)
+				}
+			}
+			return nil
+		})
+	}
+
+	// 启动读取和分发 goroutine
+	g.Go(func() error {
+		defer close(partsCh)
+		partNumber := 1
+		for {
+			buffer := make([]byte, partSize)
+			n, err := io.ReadFull(r.Body, buffer)
+
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				log.Printf("Error reading request body: %v", err)
+				return err
+			}
+
+			if n > 0 {
+				select {
+				case partsCh <- partUpload{PartNumber: partNumber, Data: buffer[:n]}:
+					partNumber++
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break // 读取完毕
+			}
+		}
+		return nil
+	})
+
+	// 等待所有 goroutine 完成
+	if err := g.Wait(); err != nil {
+		log.Printf("Error during multipart upload, aborting... UploadID: %s, Error: %v", uploadID, err)
+		// 发生错误，中止上传
+		_, abortErr := h.client.Object.AbortMultipartUpload(context.Background(), key, uploadID)
+		if abortErr != nil {
+			log.Printf("Failed to abort multipart upload %s: %v", uploadID, abortErr)
+		}
+		http.Error(w, "Multipart upload failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	close(uploadedCh)
+
+	// 3. 收集并排序已上传的分片
+	var uploadedParts []cos.Object
+	for part := range uploadedCh {
+		uploadedParts = append(uploadedParts, cos.Object{PartNumber: part.PartNumber, ETag: part.ETag})
+	}
+	sort.Slice(uploadedParts, func(i, j int) bool {
+		return uploadedParts[i].PartNumber < uploadedParts[j].PartNumber
+	})
+
+	// 4. 完成分块上传
+	log.Printf("Completing multipart upload for UploadID: %s with %d parts", uploadID, len(uploadedParts))
+	compOpt := &cos.CompleteMultipartUploadOptions{Parts: uploadedParts}
+	completeResult, _, err := h.client.Object.CompleteMultipartUpload(context.Background(), key, uploadID, compOpt)
+	if err != nil {
+		handleCOSError(w, err)
+		return
+	}
+
+	// 5. 返回成功响应
+	log.Printf("Successfully completed multipart upload for key: %s", key)
+	w.Header().Set("Content-Type", "application/xml")
+	// 将 completeResult 序列化为 XML 并返回
+	// 注意：这里为了简化，直接返回一个成功的消息。在生产环境中，应该返回 COS 返回的 XML。
+	responseXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult>
+  <Location>%s</Location>
+  <Bucket>%s</Bucket>
+  <Key>%s</Key>
+  <ETag>%s</ETag>
+</CompleteMultipartUploadResult>`, completeResult.Location, initResult.Bucket, key, completeResult.ETag)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(responseXML))
+}
+
+// proxyMultipartRequest 仅用于透传 POST (uploads, uploadId) 和 DELETE (uploadId) 请求
+func (h *COSProxyHandler) proxyMultipartRequest(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Proxying multipart management request: %s %s", r.Method, r.URL.RequestURI())
+	targetURL := h.client.BaseURL.BucketURL.ResolveReference(r.URL)
+	proxyReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header = r.Header.Clone()
+	if r.ContentLength > 0 {
+		proxyReq.ContentLength = r.ContentLength
+	}
+
+	authClient := &http.Client{
+		Transport: &cos.AuthorizationTransport{
+			SecretID:  h.secretID,
+			SecretKey: h.secretKey,
+			Transport: http.DefaultTransport,
+		},
+	}
+
+	resp, err := authClient.Do(proxyReq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // handleDeleteObject 处理删除对象请求
@@ -331,60 +503,6 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 
 	// 7. 返回成功响应
 	// 先复制响应头
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
-// handleMultipartUpload 处理分块上传相关的请求 (用于大文件或流式上传)
-func (h *COSProxyHandler) handleMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
-	log.Printf("Handling multipart upload: path=%s, query=%s", r.URL.Path, r.URL.RawQuery)
-
-	// 使用 ResolveReference 从 Bucket 基础 URL 和传入的请求 URI 构建目标 URL。
-	// 这种方法能正确处理路径（例如，避免双斜杠）和查询参数，比手动拼接字符串更健壮。
-	targetURL := h.client.BaseURL.BucketURL.ResolveReference(r.URL)
-
-	log.Printf("Proxying multipart request to: %s", targetURL.String())
-
-	// 创建新的请求
-	proxyReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
-	if err != nil {
-		log.Printf("Failed to create proxy request: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	// 复制请求头
-	proxyReq.Header = r.Header.Clone()
-	if r.ContentLength > 0 {
-		proxyReq.ContentLength = r.ContentLength
-	}
-
-	// 使用带授权的 HTTP 客户端
-	authClient := &http.Client{
-		Transport: &cos.AuthorizationTransport{
-			SecretID:  h.secretID,
-			SecretKey: h.secretKey,
-			Transport: http.DefaultTransport,
-		},
-	}
-
-	// 直接转发请求到 COS
-	resp, err := authClient.Do(proxyReq)
-	if err != nil {
-		log.Printf("Multipart upload request failed: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	log.Printf("Multipart upload response: StatusCode=%d", resp.StatusCode)
-
-	// 复制响应头
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
