@@ -93,9 +93,11 @@ func ipWhitelistMiddleware(next http.Handler, allowedIPs map[string]bool) http.H
 	})
 }
 
-// COSProxyHandler 持有 COS 客户端
+// COSProxyHandler 持有 COS 客户端和认证信息
 type COSProxyHandler struct {
-	client *cos.Client
+	client    *cos.Client
+	secretID  string
+	secretKey string
 }
 
 // ServeHTTP 是处理所有传入请求的核心方法
@@ -107,17 +109,45 @@ func (h *COSProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Processing request: Method=%s, ObjectKey=%s, FromIP=%s\n", r.Method, objectKey, r.Header.Get("X-Real-IP"))
+	// 详细的请求日志
+	log.Printf("========== Incoming Request ==========")
+	log.Printf("Method: %s", r.Method)
+	log.Printf("URL Path: %s", r.URL.Path)
+	log.Printf("URL RawQuery: %s", r.URL.RawQuery)
+	log.Printf("Object Key: %s", objectKey)
+	log.Printf("Content-Type: %s", r.Header.Get("Content-Type"))
+	log.Printf("Content-Length: %d", r.ContentLength)
+	log.Printf("From IP: %s", r.Header.Get("X-Real-IP"))
+	log.Printf("RemoteAddr: %s", r.RemoteAddr)
+	log.Printf("User-Agent: %s", r.Header.Get("User-Agent"))
 
 	switch r.Method {
 	case http.MethodGet:
 		h.handleGetObject(w, r, objectKey)
 	case http.MethodPut:
-		h.handlePutObject(w, r, objectKey)
+		// PUT 可能是普通上传或者分块上传的一部分
+		queryParams := r.URL.Query()
+		if queryParams.Has("partNumber") && queryParams.Has("uploadId") {
+			// 分块上传的单个分块: PUT /{key}?partNumber=N&uploadId=xxx
+			h.handleMultipartUpload(w, r, objectKey)
+		} else {
+			// 普通的 PUT 上传
+			h.handlePutObject(w, r, objectKey)
+		}
 	case http.MethodDelete:
 		h.handleDeleteObject(w, r, objectKey)
 	case http.MethodPost:
-		h.handlePostObject(w, r)
+		// POST 可能是表单上传或者分块上传相关操作
+		queryParams := r.URL.Query()
+		if queryParams.Has("uploads") || queryParams.Has("uploadId") {
+			// 分块上传相关的 POST 请求:
+			// - POST /{key}?uploads - 初始化分块上传
+			// - POST /{key}?uploadId=xxx - 完成分块上传
+			h.handleMultipartUpload(w, r, objectKey)
+		} else {
+			// 普通的 multipart/form-data 表单上传
+			h.handlePostObject(w, r)
+		}
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -301,6 +331,62 @@ func (h *COSProxyHandler) handlePostObject(w http.ResponseWriter, r *http.Reques
 	io.Copy(w, resp.Body)
 }
 
+// handleMultipartUpload 处理分块上传相关的请求 (用于大文件或流式上传)
+func (h *COSProxyHandler) handleMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
+	log.Printf("Handling multipart upload: key=%s, query=%s", key, r.URL.RawQuery)
+
+	// 构建完整的URL,包括查询参数
+	targetURL := h.client.BaseURL.BucketURL.String() + "/" + key
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	log.Printf("Proxying multipart request to: %s", targetURL)
+
+	// 创建新的请求
+	proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
+	if err != nil {
+		log.Printf("Failed to create proxy request: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// 复制请求头
+	proxyReq.Header = r.Header.Clone()
+	if r.ContentLength > 0 {
+		proxyReq.ContentLength = r.ContentLength
+	}
+
+	// 使用带授权的 HTTP 客户端
+	authClient := &http.Client{
+		Transport: &cos.AuthorizationTransport{
+			SecretID:  h.secretID,
+			SecretKey: h.secretKey,
+			Transport: http.DefaultTransport,
+		},
+	}
+
+	// 直接转发请求到 COS
+	resp, err := authClient.Do(proxyReq)
+	if err != nil {
+		log.Printf("Multipart upload request failed: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("Multipart upload response: StatusCode=%d", resp.StatusCode)
+
+	// 复制响应头
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 // handleCOSError 是一个辅助函数，用于处理来自 COS SDK 的错误
 func handleCOSError(w http.ResponseWriter, err error) {
 	if cosErr, ok := err.(*cos.ErrorResponse); ok {
@@ -387,7 +473,9 @@ func main() {
 
 	// --- 启动服务器 ---
 	proxyHandler := &COSProxyHandler{
-		client: client,
+		client:    client,
+		secretID:  secretID,
+		secretKey: secretKey,
 	}
 	handlerWithWhitelist := ipWhitelistMiddleware(proxyHandler, allowedIPs)
 
