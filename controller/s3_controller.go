@@ -81,6 +81,7 @@ func (ctrl *S3Controller) s3RequestDispatcher(c *gin.Context) {
 	case "DELETE":
 		ctrl.DeleteObject(c)
 	default:
+		log.Printf("method not allowed: %s %s?%s", c.Request.Method, c.Param("path"), c.Request.URL.RawQuery)
 		c.XML(http.StatusMethodNotAllowed, gin.H{"error": "Method not allowed."})
 	}
 }
@@ -125,6 +126,8 @@ func (ctrl *S3Controller) PutObject(c *gin.Context) {
 		return
 	}
 	defer resp.Body.Close()
+
+	logCOSResponse("PutObject", resp)
 
 	// 将 COS 返回的头部（特别是 ETag）透传给客户端
 	for key, values := range resp.Header {
