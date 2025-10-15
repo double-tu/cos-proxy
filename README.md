@@ -26,6 +26,7 @@
 ## 3. 核心功能 (Features)
 
 *   **完整的对象操作**: 全面支持 `GET` (获取), `PUT` (上传), `DELETE` (删除) 和 `POST` (表单上传) 方法，覆盖了对象存储的核心操作。
+*   **S3 分块上传**: 完全兼容 S3 分块上传协议，支持 `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, 和 `AbortMultipartUpload` 操作，适用于大文件上传场景。
 *   **POST 表单上传**: 支持标准 `multipart/form-data` 表单上传。您可以在表单 `key` 字段中使用 `${filename}` 占位符，代理会自动将其替换为上传文件的原始名称。
 *   **IP 白名单**: 为保障存储桶安全，所有写操作 (`PUT`, `POST`, `DELETE`) 都强制执行 IP 白名单检查。只有来自受信任 IP 的请求才会被允许执行。
 *   **智能 IP 获取**: 代理会优先从 `X-Real-IP` HTTP 头获取客户端 IP（完美兼容 Nginx），如果该头不存在，则自动回退到请求的 `RemoteAddr`，确保在各种部署场景下都能准确识别来源 IP。
