@@ -1,9 +1,11 @@
 package controllers
 
 import (
+	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"strconv"
 	"strings"
 
@@ -282,21 +284,39 @@ func (ctrl *S3Controller) CreateMultipartUpload(c *gin.Context) {
 	}
 
 	// 调用 COS SDK 初始化分块上传
-	result, _, err := ctrl.CosClient.Object.InitiateMultipartUpload(c.Request.Context(), key, opt)
+	result, resp, err := ctrl.CosClient.Object.InitiateMultipartUpload(c.Request.Context(), key, opt)
 	if err != nil {
 		ctrl.handleCOSError(c, err)
 		return
 	}
 
-	// 构造成 S3 标准的 XML 响应格式
-	responseXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Bucket>%s</Bucket>
-  <Key>%s</Key>
-  <UploadId>%s</UploadId>
-</InitiateMultipartUploadResult>`, bucket, key, result.UploadID)
+	if resp != nil {
+		if resp.Body != nil {
+			defer resp.Body.Close()
+		}
+		logCOSResponse("InitiateMultipartUpload", resp)
+	}
 
-	c.Data(http.StatusOK, "application/xml", []byte(responseXML))
+	// 构造成 S3 标准的 XML 响应格式，并确保字段经过 XML 转义
+	payload := struct {
+		XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+		XMLNS    string   `xml:"xmlns,attr"`
+		Bucket   string   `xml:"Bucket"`
+		Key      string   `xml:"Key"`
+		UploadID string   `xml:"UploadId"`
+	}{
+		XMLNS:    "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:   bucket,
+		Key:      key,
+		UploadID: result.UploadID,
+	}
+	encoded, err := xml.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		c.XML(http.StatusInternalServerError, gin.H{"error": "Failed to marshal CreateMultipartUpload response"})
+		return
+	}
+
+	c.Data(http.StatusOK, "application/xml", []byte(xml.Header+string(encoded)))
 }
 
 // UploadPart 处理上传单个分片的请求。
@@ -318,13 +338,48 @@ func (ctrl *S3Controller) UploadPart(c *gin.Context) {
 	}
 
 	// 调用 COS SDK 上传分片
+	contentLength := c.Request.ContentLength
+	if contentLength < 0 {
+		c.XML(http.StatusLengthRequired, gin.H{"error": "Content-Length header is required for UploadPart"})
+		return
+	}
+
+	uploadOpt := &cos.ObjectUploadPartOptions{
+		ContentLength: contentLength,
+	}
+	if md5 := c.GetHeader("Content-MD5"); md5 != "" {
+		uploadOpt.ContentMD5 = md5
+	}
+	if expect := c.GetHeader("Expect"); expect != "" {
+		uploadOpt.Expect = expect
+	}
+	if sha1 := c.GetHeader("x-cos-content-sha1"); sha1 != "" {
+		uploadOpt.XCosContentSHA1 = sha1
+	}
+	if sseAlg := c.GetHeader("x-amz-server-side-encryption-customer-algorithm"); sseAlg != "" {
+		uploadOpt.XCosSSECustomerAglo = sseAlg
+	}
+	if sseKey := c.GetHeader("x-amz-server-side-encryption-customer-key"); sseKey != "" {
+		uploadOpt.XCosSSECustomerKey = sseKey
+	}
+	if sseKeyMD5 := c.GetHeader("x-amz-server-side-encryption-customer-key-MD5"); sseKeyMD5 != "" {
+		uploadOpt.XCosSSECustomerKeyMD5 = sseKeyMD5
+	}
+	if trafficLimit := c.GetHeader("x-cos-traffic-limit"); trafficLimit != "" {
+		if uploadOpt.XOptionHeader == nil {
+			uploadOpt.XOptionHeader = &http.Header{}
+		}
+		uploadOpt.XOptionHeader.Set("x-cos-traffic-limit", trafficLimit)
+	}
 	// 注意：COS SDK v5 的 UploadPart 方法会自动从 Reader 中计算 ContentLength
-	resp, err := ctrl.CosClient.Object.UploadPart(c.Request.Context(), key, uploadID, partNum, c.Request.Body, nil)
+	resp, err := ctrl.CosClient.Object.UploadPart(c.Request.Context(), key, uploadID, partNum, c.Request.Body, uploadOpt)
 	if err != nil {
 		ctrl.handleCOSError(c, err)
 		return
 	}
 	defer resp.Body.Close()
+
+	logCOSResponse("UploadPart", resp)
 
 	// 关键：从 COS 的响应中获取该分片的 ETag，并设置到响应头中
 	etag := resp.Header.Get("ETag")
@@ -363,28 +418,48 @@ func (ctrl *S3Controller) CompleteMultipartUpload(c *gin.Context) {
 	for i, p := range completeUploadData.Parts {
 		cosParts[i] = cos.Object{
 			PartNumber: p.PartNumber,
-			ETag:       p.ETag,
+			// S3 ETag 规范会包含双引号，但 COS SDK 需要的是不含引号的原始 ETag
+			ETag: strings.Trim(p.ETag, `"`),
 		}
 	}
 
 	// 调用 COS SDK 完成分块上传
 	compOpt := &cos.CompleteMultipartUploadOptions{Parts: cosParts}
-	result, _, err := ctrl.CosClient.Object.CompleteMultipartUpload(c.Request.Context(), key, uploadID, compOpt)
+	result, resp, err := ctrl.CosClient.Object.CompleteMultipartUpload(c.Request.Context(), key, uploadID, compOpt)
 	if err != nil {
 		ctrl.handleCOSError(c, err)
 		return
 	}
 
-	// 成功后，返回 S3 标准的成功 XML 响应
-	responseXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Location>%s</Location>
-  <Bucket>%s</Bucket>
-  <Key>%s</Key>
-  <ETag>%s</ETag>
-</CompleteMultipartUploadResult>`, result.Location, bucket, key, result.ETag)
+	if resp != nil {
+		if resp.Body != nil {
+			defer resp.Body.Close()
+		}
+		logCOSResponse("CompleteMultipartUpload", resp)
+	}
 
-	c.Data(http.StatusOK, "application/xml", []byte(responseXML))
+	// 成功后，返回 S3 标准的成功 XML 响应，并确保字段经过 XML 转义
+	responsePayload := struct {
+		XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+		XMLNS    string   `xml:"xmlns,attr"`
+		Location string   `xml:"Location"`
+		Bucket   string   `xml:"Bucket"`
+		Key      string   `xml:"Key"`
+		ETag     string   `xml:"ETag"`
+	}{
+		XMLNS:    "http://s3.amazonaws.com/doc/2006-03-01/",
+		Location: result.Location,
+		Bucket:   bucket,
+		Key:      key,
+		ETag:     result.ETag,
+	}
+	encoded, err := xml.MarshalIndent(responsePayload, "", "  ")
+	if err != nil {
+		c.XML(http.StatusInternalServerError, gin.H{"error": "Failed to marshal CompleteMultipartUpload response"})
+		return
+	}
+
+	c.Data(http.StatusOK, "application/xml", []byte(xml.Header+string(encoded)))
 }
 
 // AbortMultipartUpload 处理中止分片上传的请求。
@@ -404,7 +479,12 @@ func (ctrl *S3Controller) AbortMultipartUpload(c *gin.Context) {
 		ctrl.handleCOSError(c, err)
 		return
 	}
-	defer resp.Body.Close()
+	if resp != nil {
+		if resp.Body != nil {
+			defer resp.Body.Close()
+		}
+		logCOSResponse("AbortMultipartUpload", resp)
+	}
 
 	// 根据 S3 规范，成功中止后应返回 204 No Content
 	c.Status(http.StatusNoContent)
@@ -444,23 +524,47 @@ func (ctrl *S3Controller) extractBucketAndKey(c *gin.Context) (bucket, key strin
 	return
 }
 
+func logCOSResponse(operation string, resp *cos.Response) {
+	if resp == nil || resp.Response == nil {
+		return
+	}
+
+	dump, err := httputil.DumpResponse(resp.Response, true)
+	if err != nil {
+		log.Printf("failed to dump COS response for %s: %v", operation, err)
+		return
+	}
+
+	log.Printf("COS %s response:\n%s", operation, string(dump))
+}
+
 // handleCOSError 是一个辅助函数，用于处理来自 COS SDK 的错误并返回 S3 兼容的 XML 响应。
 func (ctrl *S3Controller) handleCOSError(c *gin.Context, err error) {
 	if cosErr, ok := err.(*cos.ErrorResponse); ok {
-		log.Printf("COS Error: Code=%s, Message=%s, RequestID=%s", cosErr.Code, cosErr.Message, cosErr.RequestID)
-		// 确保在函数结束时关闭响应体
+		log.Printf("COS Error: Code=%s, Message=%s, RequestID=%s, StatusCode=%d", cosErr.Code, cosErr.Message, cosErr.RequestID, cosErr.Response.StatusCode)
+		// 确保在函数结束时关闭原始响应体
 		defer cosErr.Response.Body.Close()
-		// 复制原始的COS错误响应头
-		for key, values := range cosErr.Response.Header {
-			for _, value := range values {
-				c.Header(key, value)
-			}
-		}
-		// 复制原始的COS错误响应体 (XML)
-		c.DataFromReader(cosErr.Response.StatusCode, cosErr.Response.ContentLength, cosErr.Response.Header.Get("Content-Type"), cosErr.Response.Body, nil)
+
+		// 构建标准的 S3 XML 错误响应
+		s3ErrorXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>%s</Code>
+  <Message>%s</Message>
+  <RequestId>%s</RequestId>
+</Error>`, cosErr.Code, cosErr.Message, cosErr.RequestID)
+
+		// 使用原始的HTTP状态码，但返回我们自己构建的、符合S3规范的XML
+		c.Data(cosErr.Response.StatusCode, "application/xml; charset=utf-8", []byte(s3ErrorXML))
 		return
 	}
+
 	// 对于非 COS SDK 的其他错误，返回通用的服务器错误
 	log.Printf("Internal Server Error: %v", err)
-	c.XML(http.StatusInternalServerError, gin.H{"error": "Internal Server Error"})
+	// 同样返回 S3 风格的错误 XML
+	s3InternalErrorXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>%s</Message>
+</Error>`, err.Error())
+	c.Data(http.StatusInternalServerError, "application/xml; charset=utf-8", []byte(s3InternalErrorXML))
 }

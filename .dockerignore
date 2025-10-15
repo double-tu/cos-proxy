@@ -1,0 +1,24 @@
+# Git
+.git
+.gitignore
+
+# IDE/Editor
+.vscode
+.idea
+*.swp
+*.swo
+
+# Environment files
+.env
+demo.env
+
+# Documentation
+*.md
+*.txt
+
+# Docker files
+Dockerfile
+docker-compose.yaml
+
+# Other tool-specific directories
+.claude/
