@@ -13,6 +13,210 @@ import (
 	"github.com/tencentyun/cos-go-sdk-v5"
 )
 
+const s3XMLNamespace = "http://s3.amazonaws.com/doc/2006-03-01/"
+
+type listCommonPrefix struct {
+	Prefix string `xml:"Prefix"`
+}
+
+// =================================================================
+// =================== 桶级操作 (Bucket Operations) =================
+// =================================================================
+
+// ListObjects 处理 S3 的 List Objects (V1/V2) 请求。
+// GET /{bucket}?prefix=...&delimiter=...
+func (ctrl *S3Controller) ListObjects(c *gin.Context) {
+	bucket, key := ctrl.extractBucketAndKey(c)
+	if bucket == "" {
+		c.XML(http.StatusBadRequest, gin.H{"error": "Invalid bucket"})
+		return
+	}
+	if key != "" {
+		c.XML(http.StatusBadRequest, gin.H{"error": "Listing is only supported at the bucket level"})
+		return
+	}
+
+	listTypeParam := c.Query("list-type")
+	requestV2 := false
+	switch listTypeParam {
+	case "":
+		if c.Query("continuation-token") != "" || c.Query("start-after") != "" {
+			requestV2 = true
+		}
+	case "1":
+	case "2":
+		requestV2 = true
+	default:
+		c.XML(http.StatusBadRequest, gin.H{"error": "Unsupported list-type"})
+		return
+	}
+
+	opt := &cos.BucketGetOptions{
+		Prefix:       c.Query("prefix"),
+		Delimiter:    c.Query("delimiter"),
+		EncodingType: c.Query("encoding-type"),
+	}
+
+	if marker := c.Query("marker"); marker != "" {
+		opt.Marker = marker
+	}
+
+	continuationToken := ""
+	startAfter := ""
+	if requestV2 {
+		continuationToken = c.Query("continuation-token")
+		if continuationToken == "" {
+			continuationToken = c.Query("continuation_token")
+		}
+		startAfter = c.Query("start-after")
+		if continuationToken != "" {
+			opt.Marker = continuationToken
+		} else if startAfter != "" {
+			opt.Marker = startAfter
+		}
+	}
+
+	maxKeysParam := c.Query("max-keys")
+	if maxKeysParam == "" {
+		maxKeysParam = c.Query("maxKeys")
+	}
+	hasMaxKeysParam := false
+	if maxKeysParam != "" {
+		maxKeys, err := strconv.Atoi(maxKeysParam)
+		if err != nil || maxKeys < 0 {
+			c.XML(http.StatusBadRequest, gin.H{"error": "Invalid max-keys"})
+			return
+		}
+		opt.MaxKeys = maxKeys
+		hasMaxKeysParam = true
+	}
+
+	result, resp, err := ctrl.CosClient.Bucket.Get(c.Request.Context(), opt)
+	if err != nil {
+		ctrl.handleCOSError(c, err)
+		return
+	}
+	if resp != nil {
+		if resp.Body != nil {
+			defer resp.Body.Close()
+		}
+		logCOSResponse("ListObjects", resp)
+	}
+
+	name := result.Name
+	if name == "" {
+		name = bucket
+	}
+
+	var maxKeysForResponse int
+	switch {
+	case result.MaxKeys != 0:
+		maxKeysForResponse = result.MaxKeys
+	case hasMaxKeysParam:
+		maxKeysForResponse = opt.MaxKeys
+	default:
+		maxKeysForResponse = 1000
+	}
+
+	contents := result.Contents
+	commonPrefixes := toListCommonPrefixes(result.CommonPrefixes)
+	markerValue := result.Marker
+	if markerValue == "" && opt.Marker != "" {
+		markerValue = opt.Marker
+	}
+	nextMarkerValue := result.NextMarker
+	if nextMarkerValue == "" && result.IsTruncated {
+		switch {
+		case len(contents) > 0:
+			nextMarkerValue = contents[len(contents)-1].Key
+		case len(result.CommonPrefixes) > 0:
+			nextMarkerValue = result.CommonPrefixes[len(result.CommonPrefixes)-1]
+		}
+	}
+
+	if requestV2 {
+		nextContinuationToken := nextMarkerValue
+		if !result.IsTruncated {
+			nextContinuationToken = ""
+		}
+		payload := listBucketResultV2{
+			XMLNS:                 s3XMLNamespace,
+			Name:                  name,
+			Prefix:                result.Prefix,
+			StartAfter:            startAfter,
+			KeyCount:              len(contents),
+			MaxKeys:               maxKeysForResponse,
+			Delimiter:             result.Delimiter,
+			IsTruncated:           result.IsTruncated,
+			ContinuationToken:     continuationToken,
+			NextContinuationToken: nextContinuationToken,
+			Contents:              contents,
+			CommonPrefixes:        commonPrefixes,
+			EncodingType:          result.EncodingType,
+		}
+		encoded, err := xml.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			c.XML(http.StatusInternalServerError, gin.H{"error": "Failed to marshal ListObjectsV2 response"})
+			return
+		}
+		c.Data(http.StatusOK, "application/xml", []byte(xml.Header+string(encoded)))
+		return
+	}
+
+	payload := listBucketResultV1{
+		XMLNS:          s3XMLNamespace,
+		Name:           name,
+		Prefix:         result.Prefix,
+		Marker:         markerValue,
+		NextMarker:     nextMarkerValue,
+		Delimiter:      result.Delimiter,
+		MaxKeys:        maxKeysForResponse,
+		IsTruncated:    result.IsTruncated,
+		Contents:       contents,
+		CommonPrefixes: commonPrefixes,
+		EncodingType:   result.EncodingType,
+	}
+
+	encoded, err := xml.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		c.XML(http.StatusInternalServerError, gin.H{"error": "Failed to marshal ListObjects response"})
+		return
+	}
+	c.Data(http.StatusOK, "application/xml", []byte(xml.Header+string(encoded)))
+}
+
+type listBucketResultV1 struct {
+	XMLName        xml.Name           `xml:"ListBucketResult"`
+	XMLNS          string             `xml:"xmlns,attr"`
+	Name           string             `xml:"Name"`
+	Prefix         string             `xml:"Prefix,omitempty"`
+	Marker         string             `xml:"Marker,omitempty"`
+	NextMarker     string             `xml:"NextMarker,omitempty"`
+	Delimiter      string             `xml:"Delimiter,omitempty"`
+	MaxKeys        int                `xml:"MaxKeys"`
+	IsTruncated    bool               `xml:"IsTruncated"`
+	Contents       []cos.Object       `xml:"Contents,omitempty"`
+	CommonPrefixes []listCommonPrefix `xml:"CommonPrefixes,omitempty"`
+	EncodingType   string             `xml:"EncodingType,omitempty"`
+}
+
+type listBucketResultV2 struct {
+	XMLName               xml.Name           `xml:"ListBucketResult"`
+	XMLNS                 string             `xml:"xmlns,attr"`
+	Name                  string             `xml:"Name"`
+	Prefix                string             `xml:"Prefix,omitempty"`
+	StartAfter            string             `xml:"StartAfter,omitempty"`
+	KeyCount              int                `xml:"KeyCount"`
+	MaxKeys               int                `xml:"MaxKeys"`
+	Delimiter             string             `xml:"Delimiter,omitempty"`
+	IsTruncated           bool               `xml:"IsTruncated"`
+	ContinuationToken     string             `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string             `xml:"NextContinuationToken,omitempty"`
+	Contents              []cos.Object       `xml:"Contents,omitempty"`
+	CommonPrefixes        []listCommonPrefix `xml:"CommonPrefixes,omitempty"`
+	EncodingType          string             `xml:"EncodingType,omitempty"`
+}
+
 // S3Controller 负责处理所有传入的 S3 API 兼容请求。
 type S3Controller struct {
 	// BaseDomain 是代理服务的基础域名，例如 "proxy.example.com"。
@@ -72,6 +276,15 @@ func (ctrl *S3Controller) s3RequestDispatcher(c *gin.Context) {
 	// 处理单一对象操作
 	switch c.Request.Method {
 	case "GET":
+		bucket, key := ctrl.extractBucketAndKey(c)
+		if key == "" {
+			ctrl.ListObjects(c)
+			return
+		}
+		if bucket == "" {
+			c.XML(http.StatusBadRequest, gin.H{"error": "Invalid bucket"})
+			return
+		}
 		ctrl.GetObject(c)
 	case "PUT":
 		ctrl.PutObject(c)
@@ -525,6 +738,17 @@ func (ctrl *S3Controller) extractBucketAndKey(c *gin.Context) (bucket, key strin
 	}
 
 	return
+}
+
+func toListCommonPrefixes(prefixes []string) []listCommonPrefix {
+	if len(prefixes) == 0 {
+		return nil
+	}
+	result := make([]listCommonPrefix, len(prefixes))
+	for i, prefix := range prefixes {
+		result[i] = listCommonPrefix{Prefix: prefix}
+	}
+	return result
 }
 
 func logCOSResponse(operation string, resp *cos.Response) {
