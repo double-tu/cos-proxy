@@ -246,10 +246,6 @@ func (ctrl *S3Controller) RegisterRoutes(router *gin.Engine) {
 
 // s3RequestDispatcher 是一个中央分发器，根据 HTTP 方法和查询参数将请求路由到正确的处理函数。
 func (ctrl *S3Controller) s3RequestDispatcher(c *gin.Context) {
-	// 关键：忽略所有客户端传入的认证信息
-	// 在生产环境中，IP 白名单应在网络层（如 CVM 安全组、Nginx 或 iptables）强制执行。
-	c.Request.Header.Del("Authorization")
-
 	// 根据 S3 API 规范，分片上传操作通过查询参数来区分
 	if _, ok := c.Request.URL.Query()["uploads"]; ok {
 		// 这是 CreateMultipartUpload 请求

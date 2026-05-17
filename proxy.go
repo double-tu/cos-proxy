@@ -53,11 +53,12 @@ func requestLoggingMiddleware() gin.HandlerFunc {
 	}
 }
 
-// ipWhitelistMiddleware 是一个 Gin 中间件，用于检查IP白名单
-func ipWhitelistMiddleware(allowedIPs map[string]bool) gin.HandlerFunc {
+// writeAccessMiddleware 是一个 Gin 中间件，用于检查写操作准入。
+func writeAccessMiddleware(allowedIPs map[string]bool, s3Auth *s3SignatureAuthenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 对于 GET 和 HEAD 请求，所有IP都允许访问
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			stripClientS3Auth(c.Request)
 			c.Next()
 			return
 		}
@@ -69,14 +70,32 @@ func ipWhitelistMiddleware(allowedIPs map[string]bool) gin.HandlerFunc {
 			clientIP = c.ClientIP()
 		}
 		if !allowedIPs[clientIP] {
-			log.Printf("Forbidden: IP %s is not in the whitelist for method %s.", clientIP, c.Request.Method)
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Forbidden: IP not allowed"})
-			return
+			if err := s3Auth.Verify(c.Request); err != nil {
+				log.Printf("Forbidden: IP %s is not in the whitelist and S3 signature is invalid for method %s: %v.", clientIP, c.Request.Method, err)
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Forbidden: write access denied"})
+				return
+			}
+			log.Printf("Allowed: S3 signature is valid for IP %s and method %s.", clientIP, c.Request.Method)
+			stripClientS3Auth(c.Request)
+		} else {
+			log.Printf("Allowed: IP %s is in the whitelist for method %s.", clientIP, c.Request.Method)
+			stripClientS3Auth(c.Request)
 		}
-
-		log.Printf("Allowed: IP %s is in the whitelist for method %s.", clientIP, c.Request.Method)
 		c.Next()
 	}
+}
+
+func stripClientS3Auth(r *http.Request) {
+	r.Header.Del("Authorization")
+	r.Header.Del("X-Amz-Security-Token")
+
+	query := r.URL.Query()
+	for key := range query {
+		if strings.HasPrefix(strings.ToLower(key), "x-amz-") {
+			query.Del(key)
+		}
+	}
+	r.URL.RawQuery = query.Encode()
 }
 
 func main() {
@@ -91,6 +110,8 @@ func main() {
 	bucketURL := os.Getenv("COS_BUCKET_URL_INTERNAL")
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")
+	proxyAccessKey := os.Getenv("PROXY_ACCESS_KEY")
+	proxySecretKey := os.Getenv("PROXY_SECRET_KEY")
 
 	if bucketURL == "" || secretID == "" || secretKey == "" {
 		log.Fatal("Missing required environment variables: COS_BUCKET_URL_INTERNAL, TENCENTCLOUD_SECRET_ID, TENCENTCLOUD_SECRET_KEY")
@@ -126,6 +147,12 @@ func main() {
 		finalAllowedList = append(finalAllowedList, ip)
 	}
 	log.Printf("Total %d unique IPs are whitelisted for write operations: %v", len(finalAllowedList), finalAllowedList)
+	s3Auth := newS3SignatureAuthenticator(proxyAccessKey, proxySecretKey)
+	if s3Auth == nil {
+		log.Println("Warning: PROXY_ACCESS_KEY/PROXY_SECRET_KEY are not fully configured. Write operations require IP whitelist only.")
+	} else {
+		log.Printf("S3 signature authentication enabled for access key: %s", proxyAccessKey)
+	}
 
 	// --- COS 客户端初始化 ---
 	u, err := url.Parse(bucketURL)
@@ -146,7 +173,7 @@ func main() {
 
 	// --- 中间件设置 ---
 	router.Use(requestLoggingMiddleware())
-	router.Use(ipWhitelistMiddleware(allowedIPs))
+	router.Use(writeAccessMiddleware(allowedIPs, s3Auth))
 
 	// --- 路由和控制器设置 ---
 	s3Controller := controllers.NewS3Controller(baseDomain, cosClient)

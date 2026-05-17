@@ -62,6 +62,10 @@ TENCENTCLOUD_SECRET_KEY=您的SecretKey
 
 # 额外的白名单 IP，多个 IP 用逗号分隔 (例如: 8.8.8.8,1.1.1.1)
 WHITELIST_IPS=
+
+# 可选：用于兼容 S3 客户端的写操作认证，不要填写腾讯云真实密钥
+PROXY_ACCESS_KEY=
+PROXY_SECRET_KEY=
 ```
 
 **4. 启动服务**
@@ -81,6 +85,8 @@ docker-compose up -d
 | `TENCENTCLOUD_SECRET_ID`  | **(必需)** 用于访问腾讯云 API 的 Secret ID。建议使用子账号密钥以遵循最小权限原则。                                                     | `AKIDxxxxxxxxxxxxxxxxxxxxxxxxxxxx`                                  |
 | `TENCENTCLOUD_SECRET_KEY` | **(必需)** 用于访问腾讯云 API 的 Secret Key。                                                                                      | `yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy`                                  |
 | `WHITELIST_IPS`           | **(可选)** 额外的 IP 白名单列表，用于允许指定的外部 IP 执行写操作。多个 IP 地址之间请用英文逗号 `,` 分隔。服务所在主机的 IP 会被自动添加。 | `8.8.8.8,1.1.1.1`                                                   |
+| `PROXY_ACCESS_KEY`        | **(可选)** 代理本地校验 S3 SigV4 签名使用的 Access Key。配置后，非白名单 IP 的写操作可通过标准 S3 客户端签名放行。不要复用腾讯云真实密钥。 | `proxy-upload`                                                      |
+| `PROXY_SECRET_KEY`        | **(可选)** 代理本地校验 S3 SigV4 签名使用的 Secret Key。必须与客户端配置的 S3 Secret Key 一致。                                      | `change-this-long-random-secret`                                    |
 
 ## 6. API 使用示例 (API Usage)
 
@@ -93,13 +99,13 @@ curl http://127.0.0.1:17700/path/to/your/object.jpg --output object.jpg
 
 **上传对象 (PUT)**
 ```bash
-# 需要确保您的公网 IP 已被添加到 WHITELIST_IPS
+# 需要确保您的公网 IP 已被添加到 WHITELIST_IPS，或 S3 客户端已配置 PROXY_ACCESS_KEY/PROXY_SECRET_KEY
 curl -X PUT --data-binary @"/path/to/local/file.txt" http://127.0.0.1:17700/remote/path/file.txt
 ```
 
 **删除对象 (DELETE)**
 ```bash
-# 需要确保您的公网 IP 已被添加到 WHITELIST_IPS
+# 需要确保您的公网 IP 已被添加到 WHITELIST_IPS，或 S3 客户端已配置 PROXY_ACCESS_KEY/PROXY_SECRET_KEY
 curl -X DELETE http://127.0.0.1:17700/path/to/your/object.jpg
 ```
 
@@ -108,7 +114,7 @@ curl -X DELETE http://127.0.0.1:17700/path/to/your/object.jpg
 ```bash
 # -F "key=upload/images/${filename}"  -> COS 中的存储路径，${filename} 会被替换为 "my-photo.png"
 # -F "file=@/path/to/local/my-photo.png" -> 本地文件
-# 需要确保您的公网 IP 已被添加到 WHITELIST_IPS
+# 需要确保您的公网 IP 已被添加到 WHITELIST_IPS，或 S3 客户端已配置 PROXY_ACCESS_KEY/PROXY_SECRET_KEY
 curl -X POST \
   -F "key=upload/images/${filename}" \
   -F "file=@/path/to/local/my-photo.png" \
@@ -118,4 +124,4 @@ curl -X POST \
 ## 7. 注意事项 (Notes)
 
 *   **部署环境**: 为了实现节省流量费用的目的，此代理服务**必须**部署在能够通过内网访问 COS 的腾讯云 CVM 上。部署在其他云服务商或本地计算机上将无法利用内网连接。
-*   **安全**: IP 白名单是保障您存储桶写操作安全的关键。请务必将所有需要上传或修改文件的服务器 IP 添加到 `.env` 文件的 `WHITELIST_IPS` 变量中。切勿将不必要的 IP 加入白名单。
+*   **安全**: IP 白名单和 S3 SigV4 代理密钥是保障您存储桶写操作安全的关键。请务必将固定写入来源加入 `WHITELIST_IPS`，动态 IP 客户端则配置 `PROXY_ACCESS_KEY` 和 `PROXY_SECRET_KEY`。切勿将腾讯云真实密钥发给客户端。
